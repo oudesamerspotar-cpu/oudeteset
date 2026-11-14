@@ -55,3 +55,10 @@ server.log
 # أسرار — لا ترفع أبدًا
 .env*
 !.env.example
+
+# ملفات التشغيل المحلية — لا تُرفع
+/db
+/tool-results
+/upload
+/download
+/.zscripts
