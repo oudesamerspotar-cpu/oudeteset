@@ -5,7 +5,7 @@
 
 export type ProviderId = "kie" | "cometapi";
 export type TaskProvider = ProviderId | "merger";
-export type MediaType = "image" | "video" | "merge";
+export type MediaType = "image" | "video" | "merge" | "slideshow";
 
 export interface ModelDef {
   canonical: string; // الاسم كما يراه عميل MCP
@@ -44,6 +44,8 @@ export const MODELS: ModelDef[] = [IMAGE_MODEL, VIDEO_MODEL];
 
 export const MERGE_MODEL = "video-merger"; // اسم ثابت لمهام الدمج (provider = merger)
 
+export const SLIDESHOW_MODEL = "images-to-video"; // اسم ثابت لمهام العرض الصوري (provider = merger)
+
 /** توحيد اسم الموديل عبر الاسماء البديلة — يعيد canonical أو null إن كان غير معروف */
 export function normalizeModel(name: string | undefined | null): ModelDef | null {
   if (!name) return null;
@@ -56,5 +58,16 @@ export function normalizeModel(name: string | undefined | null): ModelDef | null
 
 /** الموديل الافتراضي لكل نوع وسائط */
 export function defaultModelFor(type: MediaType): ModelDef {
-  return type === "image" ? IMAGE_MODEL : VIDEO_MODEL;
+  if (type === "image") return IMAGE_MODEL;
+  if (type === "slideshow") {
+    // العرض الصوري بلا موديل ذكاء اصطناعي (ffmpeg محلي) — كائن رمزي يكفي مسارات التتبع
+    return {
+      canonical: SLIDESHOW_MODEL,
+      aliases: [],
+      type: "slideshow",
+      providers: [],
+      providerModel: { kie: SLIDESHOW_MODEL, cometapi: SLIDESHOW_MODEL },
+    };
+  }
+  return VIDEO_MODEL;
 }

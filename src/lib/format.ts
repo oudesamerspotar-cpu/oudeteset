@@ -27,6 +27,11 @@ export function formatCompleted(task: TaskRow): string {
     if (urls[0] && urls[0].startsWith("http")) lines.push("", `![image](${urls[0]})`, "", `الرابط المباشر: ${urls[0]}`);
     else if (urls[0]) lines.push("", `الرابط المباشر: ${urls[0]}`);
     for (const u of urls.slice(1)) lines.push("", `الرابط المباشر: ${u}`);
+  } else if (task.type === "slideshow") {
+    lines.push("✅ تم إنشاء الفيديو من الصور بنجاح (رأسي 9:16 — تحريك خفيف على كل صورة)");
+    for (const u of urls) lines.push("", `الرابط المباشر: ${u}`);
+    // ملف العرض الصوري يُخزَّن في خدمة الدمج بنفس صلاحية ملفات الدمج
+    lines.push("", "⚠️ ملف الفيديو يُحذف من خدمة الدمج بعد ~24 ساعة — شاهده/نزّله سريعًا.");
   } else if (task.type === "video") {
     lines.push("✅ تم توليد الفيديو بنجاح");
     for (const u of urls) lines.push("", `الرابط المباشر: ${u}`);

@@ -41,7 +41,57 @@
 | `GET` | `/api/config` | الحدود العامة + version (فحص الجهوزية) |
 | `GET` | `/api/cron` | حذف المهام المنتهية (Cron يومي في `vercel.json`) |
 
-### أمثلة curl
+| Method | Endpoint | الوظيفة |
+|---|---|---|
+| `POST` | `/api/jobs` | إنشاء مهمة دمج |
+| `POST` | `/api/upload?job=<id>&seq=<n>&chunk=<k>` | رفع أجزاء الملفات (ثنائي ≤4MB) |
+| `POST` | `/api/jobs/<id>/process` | تنفيذ الدمج كاملًا → رابط الفيديو النهائي |
+| `GET` | `/api/jobs/<id>` | الحالة + التقدم (0–100) + الرابط عند الاكتمال |
+| `GET` | `/api/jobs/<id>/video` | بث الناتج بدعم Range، و`?download=1` للتحميل |
+| `DELETE` | `/api/jobs/<id>` | حذف فوري شامل |
+| `GET` | `/api/config` | الحدود العامة + version (فحص الجهوزية) |
+| `GET` | `/api/cron` | حذف المهام المنتهية (Cron يومي في `vercel.json`) |
+
+### العرض الصوري — صور ← فيديو رأسي 9:16 بتحريك خفيف (بلا أي API مدفوع)
+
+| Method | Endpoint | الوظيفة |
+|---|---|---|
+| `POST` | `/api/slideshow` | إنشاء مهمة عرض صوري: `{"images":["url",...]}` روابط مباشرة أو `{"sources":[{"kind":"file","name","size","mime"},...]}` لرفع ملفات. اختياري: `"clip_seconds": 5..20` (افتراضي 15). القيود: 4–8 صور، ≤ SLIDESHOW_IMAGE_MAX_MB لكل صورة |
+| `POST` | `/api/slideshow/<id>/clip?seq=<k>` | معالجة الصورة رقم k: مقطع 15 ثانية رأسي 720×1280 @ 24fps بتقريب/تحريك خفيف (Ken Burns) + وهج دخول/خروج — يخزَّن في Turso |
+| `POST` | `/api/slideshow/<id>/merge` | دمج المقاطع في فيديو MP4 واحد عبر محوّل concat مع `-c copy` (بلا إعادة ترميز — ثوانٍ معدودة) |
+| `GET` | `/api/slideshow/<id>` | حالة تفصيلية: الصور الجاهزة/المتبقية + روابط الخطوات + الناتج عند الاكتمال |
+| `DELETE` | `/api/slideshow/<id>` | حذف شامل (نفس حذف مهام الدمج) |
+
+الناتج النهائي يُبَث ويُنزَّل من نفس نقاط الدمج: `GET /api/jobs/<id>/video` و`?download=1`.
+التقدم الكلي: رفع 0–39٪ → مقاطع 40–90٪ → دمج 90–100٪. تنفيذ كل صورة في استدعاء مستقل يُبقي كل نداء داخل مهلة دالة Vercel (60 ثانية على الخطة المجانية — الدقة 720×1280 مضبوطة لهذا السبب، ويمكن رفعها بمتغيرات `SLIDESHOW_WIDTH`/`SLIDESHOW_HEIGHT`).
+
+```bash
+# 1) إنشاء مهمة عرض صوري من روابط
+curl -X POST https://<دومينك>/api/slideshow \
+  -H "Content-Type: application/json" \
+  -d '{"images":["https://example.com/1.jpg","https://example.com/2.jpg","https://example.com/3.jpg","https://example.com/4.jpg"]}'
+# → 201 {"jobId":"...","imageCount":4,"clipSeconds":15,"clipUrl":".../clip?seq=<k>","mergeUrl":".../merge",...}
+
+# 2) معالجة كل صورة بالترتيب (كل استدعاء ~3–40 ثانية حسب قدرة المعالج)
+curl -X POST "https://<دومينك>/api/slideshow/<id>/clip?seq=0"
+# → {"ok":true,"seq":0,"clipsReady":1,"totalImages":4,"progress":52,"remaining":[1,2,3],...}
+
+# 3) بعد اكتمال كل المقاطع: الدمج النهائي
+curl -X POST "https://<دومينك>/api/slideshow/<id>/merge"
+# → {"status":"done","videoUrl":"https://<دومينك>/api/jobs/<id>/video","downloadUrl":"...?download=1",
+#    "duration":60.0,"resolution":"720x1280","size":4567890}
+```
+
+| متغير البيئة (اختياري) | الافتراضي | الوظيفة |
+|---|---|---|
+| `SLIDESHOW_MIN_IMAGES` / `SLIDESHOW_MAX_IMAGES` | 4 / 8 | حدود عدد الصور |
+| `SLIDESHOW_IMAGE_MAX_MB` | 15 | حد حجم الصورة الواحدة |
+| `SLIDESHOW_CLIP_SEC` | 15 | مدة مقطع كل صورة (قابلة للتجاوز لكل مهمة بـ `clip_seconds` 5–20) |
+| `SLIDESHOW_WIDTH` / `SLIDESHOW_HEIGHT` | 720 / 1280 | مقاس الناتج (رأسي 9:16) |
+| `SLIDESHOW_FPS` | 24 | معدل الإطارات |
+| `SLIDESHOW_PRESET` / `SLIDESHOW_CRF` | veryfast / 20 | سرعة/جودة ترميز libx264 |
+
+### أمثلة curl (الدمج العادي)
 
 ```bash
 # 1) إنشاء مهمة من روابط مباشرة
@@ -83,7 +133,7 @@ curl -X DELETE https://<دومينك>/api/jobs/<id>
 
 ## التخزين والحذف التلقائي
 
-- جداول: `jobs`، `sources`، `source_chunks`، `output_chunks` — تُنشأ بـ `CREATE TABLE IF NOT EXISTS` بمفاتيح مركبة.
+- جداول: `jobs`، `sources`، `source_chunks`، `output_chunks`، `clip_chunks` (مقاطع العرض الصوري الوسيطة) — تُنشأ بـ `CREATE TABLE IF NOT EXISTS` بمفاتيح مركبة، مع ترحيل تلقائي يضيف عمودي `type` (merge/slideshow) و`params_json` لقاعدة قائمة.
 - كل Blob يُقسَّم لصفوف 2MB (حد عملي لحجم طلب Turso) ويُقرأ تدفقيًا بصفحات من 8 صفوف مع تقليم أول/آخر جزء حسب المدى المطلوب (Range 206).
 - `expires_at = created_at + 24 ساعة`؛ التنظيف كسول عند كل إنشاء/دمج + نقطة `/api/cron` مجدولة يوميًا في `vercel.json`.
 - DELETE يحذف كل صفوف المهمة في batch واحد، وبعد نجاح الدمج تُحذف `source_chunks` — الناتج فقط هو المطلوب.

@@ -64,6 +64,111 @@ export async function createMergeJob(urls: string[]): Promise<MergeJobCreated> {
   return { jobId, status: String(body.status ?? "queued"), expiresAt: body.expiresAt as string | undefined };
 }
 
+/* ===== العرض الصوري (صور ← فيديو رأسي 9:16 بتحريك خفيف) ===== */
+
+export interface SlideshowJobCreated {
+  jobId: string;
+  imageCount: number;
+  clipSeconds: number;
+  expiresAt?: string;
+}
+
+export interface SlideshowClipState {
+  seq: number;
+  name: string;
+  ready: boolean;
+  size: number;
+}
+
+export interface SlideshowJobStatus {
+  status: string;
+  progress: number;
+  imageCount: number;
+  clipSeconds: number;
+  clipsReady: number;
+  clips: SlideshowClipState[];
+  videoUrl?: string;
+  error?: string;
+}
+
+/** إنشاء مهمة عرض صوري من روابط صور مباشرة (4–8 صور) */
+export async function createSlideshowJob(imageUrls: string[], clipSeconds = 15): Promise<SlideshowJobCreated> {
+  const { status, body } = await mergerFetch(`${MERGER_BASE}/api/slideshow`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ images: imageUrls, clip_seconds: clipSeconds }),
+  }, 20_000);
+  if (status < 200 || status >= 300) {
+    throw new MergerError(status, String(body.error ?? body.message ?? `HTTP ${status}`));
+  }
+  const jobId = body.jobId as string | undefined;
+  if (!jobId) throw new MergerError(500, "استجابة إنشاء مهمة العرض الصوري بلا jobId");
+  return {
+    jobId,
+    imageCount: Number(body.imageCount ?? imageUrls.length),
+    clipSeconds: Number(body.clipSeconds ?? clipSeconds),
+    expiresAt: body.expiresAt as string | undefined,
+  };
+}
+
+/** معالجة صورة واحدة: تحويلها لمقطع بتحريك خفيف (يستغرق ~5–40 ثانية لكل صورة) */
+export async function processSlideshowClip(jobId: string, seq: number): Promise<void> {
+  const { status, body } = await mergerFetch(
+    `${MERGER_BASE}/api/slideshow/${encodeURIComponent(jobId)}/clip?seq=${seq}`,
+    { method: "POST" },
+    300_000,
+  );
+  if (status >= 400) {
+    throw new MergerError(status, String(body.error ?? `HTTP ${status}`));
+  }
+}
+
+/** الدمج النهائي للمقاطع في فيديو واحد — سريع (-c copy) */
+export async function mergeSlideshow(jobId: string): Promise<{ videoUrl: string; downloadUrl?: string; duration?: number; resolution?: string; size?: number }> {
+  const { status, body } = await mergerFetch(`${MERGER_BASE}/api/slideshow/${encodeURIComponent(jobId)}/merge`, { method: "POST" }, 180_000);
+  if (status >= 400) {
+    throw new MergerError(status, String(body.error ?? `HTTP ${status}`));
+  }
+  const videoUrl =
+    (typeof body.videoUrl === "string" && body.videoUrl.startsWith("http") && body.videoUrl) ||
+    (typeof body.downloadUrl === "string" && body.downloadUrl.startsWith("http") && body.downloadUrl) ||
+    `${MERGER_BASE}/api/jobs/${encodeURIComponent(jobId)}/video`;
+  return {
+    videoUrl,
+    downloadUrl: typeof body.downloadUrl === "string" ? body.downloadUrl : undefined,
+    duration: typeof body.duration === "number" ? body.duration : undefined,
+    resolution: typeof body.resolution === "string" ? body.resolution : undefined,
+    size: typeof body.size === "number" ? body.size : undefined,
+  };
+}
+
+/** حالة مهمة العرض الصوري بالتفصيل (clips جاهزة/متبقية) */
+export async function getSlideshowJob(jobId: string): Promise<SlideshowJobStatus> {
+  const { status, body } = await mergerFetch(`${MERGER_BASE}/api/slideshow/${encodeURIComponent(jobId)}`, { method: "GET" }, 15_000);
+  if (status === 404) {
+    return { status: "missing", progress: 0, imageCount: 0, clipSeconds: 15, clipsReady: 0, clips: [], error: "مهمة العرض الصوري غير موجودة (حُذفت أو انتهت صلاحيتها بعد 24 ساعة)" };
+  }
+  if (status >= 400) {
+    throw new MergerError(status, String(body.error ?? body.message ?? `HTTP ${status}`));
+  }
+  const clips = Array.isArray(body.clips) ? (body.clips as Record<string, unknown>[]) : [];
+  return {
+    status: String(body.status ?? "unknown"),
+    progress: Number(body.progress ?? 0),
+    imageCount: Number(body.imageCount ?? clips.length),
+    clipSeconds: Number(body.clipSeconds ?? 15),
+    clipsReady: Number(body.clipsReady ?? 0),
+    clips: clips.map((c) => ({
+      seq: Number(c.seq ?? 0),
+      name: String(c.name ?? ""),
+      ready: Boolean(c.ready),
+      size: Number(c.size ?? 0),
+    })),
+    videoUrl: typeof body.videoUrl === "string" ? body.videoUrl : undefined,
+    error: typeof body.error === "string" ? body.error : undefined,
+  };
+}
+
 /** تنفيذ الدمج (يستغرق ~10–15 ثانية blocking) — يُستدعى خلفيًا وبمرة واحدة فقط */
 export async function processMergeJob(jobId: string): Promise<void> {
   const { status, body } = await mergerFetch(`${MERGER_BASE}/api/jobs/${encodeURIComponent(jobId)}/process`, { method: "POST" });

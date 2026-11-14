@@ -6,7 +6,8 @@
  * الهيدر يعرض حالة /api/health (شارة Turso متصل خضراء / غير متصل حمراء).
  */
 import { useCallback, useEffect, useState } from "react";
-import { KeyRound, Activity, PlugZap, ShieldCheck, Database } from "lucide-react";
+import Link from "next/link";
+import { KeyRound, Activity, PlugZap, ShieldCheck, Database, Film } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { KeysManager, type KeyItem } from "@/components/dashboard/KeysManager";
 import { TasksBoard, type TasksStats } from "@/components/dashboard/TasksBoard";
@@ -97,6 +98,23 @@ export default function DashboardPage() {
       </header>
 
       <main className="flex-1 mx-auto w-full max-w-7xl px-4 py-6 space-y-6">
+        {/* شريط الميزة الجديدة: صور ← فيديو رأسي بتحريك خفيف (بلا API مدفوع) */}
+        <Link
+          href="/images-to-video"
+          className="block rounded-xl border border-emerald-500/30 bg-gradient-to-l from-emerald-500/10 via-zinc-900/60 to-zinc-900/40 hover:border-emerald-500/60 transition-colors"
+        >
+          <div className="px-4 py-3 flex flex-wrap items-center gap-3">
+            <div className="h-9 w-9 rounded-lg bg-emerald-500/15 border border-emerald-500/40 flex items-center justify-center">
+              <Film className="h-5 w-5 text-emerald-400" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-emerald-200">جديد: تحويل الصور إلى فيديو رأسي 9:16 — بلا أي API مدفوع</p>
+              <p className="text-xs text-zinc-400">ارفع من 4 إلى 8 صور → مقطع 15 ثانية بتحريك خفيف لكل صورة (ffmpeg) → فيديو MP4 واحد جاهز للتنزيل</p>
+            </div>
+            <span className="ms-auto text-xs text-emerald-300 font-medium">افتح صفحة الرفع ←</span>
+          </div>
+        </Link>
+
         <div className="grid gap-6 xl:grid-cols-3">
           {/* أ) مدير المفاتيح */}
           <section className="xl:col-span-1">

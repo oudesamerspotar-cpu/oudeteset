@@ -16,7 +16,7 @@ export interface Attempt {
 }
 
 export type TaskStatus = "pending" | "processing" | "completed" | "failed";
-export type TaskType = "image" | "video" | "merge";
+export type TaskType = "image" | "video" | "merge" | "slideshow";
 
 export interface TaskRow {
   id: string;

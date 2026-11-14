@@ -11,7 +11,7 @@ import {
   type ServerNotification,
 } from "@modelcontextprotocol/sdk/types.js";
 import { formatBadModel, formatNoKeys, formatTaskForClient } from "@/lib/format";
-import { runGeneration, runMerge, refreshTask, type ProgressNotify } from "@/lib/generation";
+import { runGeneration, runImagesToVideo, runMerge, refreshTask, type ProgressNotify } from "@/lib/generation";
 import { listRecentTasks } from "@/lib/turso";
 
 export const SERVER_INFO = { name: "media-generator-mcp", version: "1.2.0" } as const;
@@ -21,6 +21,7 @@ Workflow: call generate_image or generate_video. If the response contains finish
 If it returns a task_id with status PROCESSING, call get_task with that task_id every ~10 seconds until status is completed (show the URL) or failed (explain why).
 IMPORTANT: the server automatically switches API keys in strict order on any failure (exhausted balance, invalid key, rate limits) and continues the SAME task under the same task_id — you will never encounter key/balance errors. Never stop or warn the user about keys or balances; just keep polling get_task until the result appears.
 To concatenate several finished clips into one video, call merge_videos with 'urls' (direct links) or 'task_ids' (completed video tasks, in merge order); track it with get_task the same way. Note: the merged file is stored on the merging service for ~24 hours only — tell the user to watch/download it promptly.
+To build a vertical 9:16 slideshow video from 4–8 still images (gentle Ken-Burns motion per image, no paid API), call images_to_video with 'images' (direct image links) or 'task_ids' (completed image tasks); track with get_task. The final file also expires after ~24 hours.
 Use list_media to recall previously generated media from the database.`;
 
 type ExtraLike = {
@@ -105,6 +106,37 @@ const TOOL_DEFS = [
     },
   },
   {
+    name: "images_to_video",
+    title: "Images To Video",
+    description:
+      "Turn 4–8 images into ONE vertical 9:16 MP4 with gentle Ken-Burns motion (zoom/pan) on every image (~15s per clip), " +
+      "then merge all clips into a single video — NO paid AI API involved (local ffmpeg on the merging service). " +
+      "Pass 'images' (public direct image links — e.g. generate_image results) or 'task_ids' (completed image generation tasks, in playback order). " +
+      "Usually completes within the wait window with live progress; otherwise returns a task_id — track it with get_task. " +
+      'Note: the final file is stored on the merging service for ~24 hours only — tell the user to watch/download it promptly.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        images: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 4,
+          maxItems: 8,
+          description: "Public direct image URLs (http/https) in playback order — each becomes a ~15s motion clip.",
+        },
+        task_ids: {
+          type: "array",
+          items: { type: "string" },
+          minItems: 4,
+          maxItems: 8,
+          description: "Alternative to images: task_ids of COMPLETED image generation tasks — their result URLs are used in this order.",
+        },
+        clip_seconds: { type: "integer", minimum: 5, maximum: 20, default: 15, description: "Seconds per image clip." },
+        wait_seconds: { type: "integer", minimum: 0, maximum: 240, default: 240 },
+      },
+    },
+  },
+  {
     name: "get_task",
     title: "Get Task",
     description:
@@ -124,7 +156,7 @@ const TOOL_DEFS = [
     inputSchema: {
       type: "object",
       properties: {
-        type: { type: "string", enum: ["image", "video", "merge"] },
+        type: { type: "string", enum: ["image", "video", "merge", "slideshow"] },
         status: { type: "string", enum: ["completed", "failed", "processing"] },
         limit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
       },
@@ -251,6 +283,22 @@ export function buildMcpServer(): Server {
           return text(f.text, f.isError);
         });
 
+      case "images_to_video":
+        return safeCall(async () => {
+          const res = await runImagesToVideo(
+            {
+              images: strArr(args.images),
+              task_ids: strArr(args.task_ids),
+              clip_seconds: num(args.clip_seconds),
+              wait_seconds: num(args.wait_seconds),
+            },
+            notify,
+            extra.signal,
+          );
+          const f = formatTaskForClient(res.task);
+          return text(f.text, f.isError);
+        });
+
       case "get_task":
         return safeCall(async () => {
           const taskId = str(args.task_id);
@@ -266,7 +314,7 @@ export function buildMcpServer(): Server {
           if (tasks.length === 0) {
             return text("لا توجد وسائط مخزنة بعد — قائمة النتائج فارغة. ابدأ بأداة generate_image أو generate_video.");
           }
-          const icons: Record<string, string> = { image: "🖼️ صورة", video: "🎬 فيديو", merge: "🔗 دمج" };
+          const icons: Record<string, string> = { image: "🖼️ صورة", video: "🎬 فيديو", merge: "🔗 دمج", slideshow: "🎞️ عرض صوري" };
           const statusAr: Record<string, string> = { completed: "مكتملة", failed: "فاشلة", processing: "جارية", pending: "جارية" };
           const lines: string[] = [`📁 أحدث الوسائط المخزنة (${tasks.length}):`];
           tasks.forEach((t, i) => {

@@ -36,8 +36,20 @@ const LIMITS = {
   // الصفوف تُقرأ تدفقيًا بصفحات من 8 صفوف
   BLOB_PAGE_ROWS: 8,
   JOB_TTL_HOURS: 24,
+  /* ===== العرض الصوري (صور ← فيديو 9:16 بتحريك خفيف) ===== */
+  SLIDESHOW_MIN_IMAGES: intEnv("SLIDESHOW_MIN_IMAGES", 4),
+  SLIDESHOW_MAX_IMAGES: intEnv("SLIDESHOW_MAX_IMAGES", 8),
+  SLIDESHOW_IMAGE_MAX_MB: intEnv("SLIDESHOW_IMAGE_MAX_MB", 15),
+  // مدة المقطع الواحد (ثوانٍ) و fps — 15 ثانية × 24fps = 360 إطارًا لكل صورة
+  SLIDESHOW_CLIP_SEC: intEnv("SLIDESHOW_CLIP_SEC", 15),
+  SLIDESHOW_FPS: intEnv("SLIDESHOW_FPS", 24),
+  // رأسي 9:16 — 720x1280 افتراضيًا لضمان إتمام كل مقطع داخل مهلة الدالة (60 ثانية على Hobby)
+  SLIDESHOW_WIDTH: intEnv("SLIDESHOW_WIDTH", 720),
+  SLIDESHOW_HEIGHT: intEnv("SLIDESHOW_HEIGHT", 1280),
+  SLIDESHOW_PRESET: process.env.SLIDESHOW_PRESET || "veryfast",
+  SLIDESHOW_CRF: intEnv("SLIDESHOW_CRF", 20),
 };
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 
 module.exports = { LIMITS, VERSION, loadEnvFile };

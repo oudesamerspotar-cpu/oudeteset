@@ -3,11 +3,17 @@
  * الجسم خام application/octet-stream — يُقسَّم داخليًا لصفوف 2MB في Turso.
  * الجزء k يُستبدل عند إعادة الرفع (قابل للتكرار بعد فشل شبكة).
  */
-const { sendJson, sendError, readBinaryBody } = require("../lib/respond");
+const { sendJson, sendError, readBinaryBody, cors } = require("../lib/respond");
 const store = require("../lib/db");
 const { LIMITS } = require("../lib/env");
 
 module.exports = async (req, res) => {
+  // دعم CORS preflight (رفع أجزاء من متصفح تطبيق منفصل)
+  if (req.method === "OPTIONS") {
+    cors(res);
+    res.statusCode = 204;
+    return res.end();
+  }
   if (req.method !== "POST") return sendError(res, 405, "طريقة غير مسموحة — استخدم POST");
   const jobId = req.query.job;
   const seq = Number(req.query.seq);

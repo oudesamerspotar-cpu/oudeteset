@@ -14,7 +14,7 @@ import { Progress } from "@/components/ui/progress";
 
 export interface TaskItem {
   id: string;
-  type: "image" | "video" | "merge";
+  type: "image" | "video" | "merge" | "slideshow";
   model: string;
   status: "pending" | "processing" | "completed" | "failed";
   progress: number;
@@ -37,6 +37,7 @@ const typeInfo: Record<TaskItem["type"], { label: string; icon: string }> = {
   image: { label: "صورة", icon: "🖼️" },
   video: { label: "فيديو", icon: "🎬" },
   merge: { label: "دمج", icon: "🔗" },
+  slideshow: { label: "عرض صوري", icon: "🎞️" },
 };
 
 const statusInfo = (s: TaskItem["status"]) => {

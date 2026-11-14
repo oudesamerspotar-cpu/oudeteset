@@ -32,7 +32,9 @@ function ensureSchema() {
               duration REAL,
               resolution TEXT,
               expires_at TEXT NOT NULL,
-              created_at TEXT NOT NULL
+              created_at TEXT NOT NULL,
+              type TEXT DEFAULT 'merge',
+              params_json TEXT DEFAULT '{}'
             )`,
             args: [],
           },
@@ -72,16 +74,46 @@ function ensureSchema() {
             )`,
             args: [],
           },
+          /* مقاطع العرض الصوري الوسيطة: كل صورة معالجة تُخزَّن هنا قبل الدمج النهائي */
+          {
+            sql: `CREATE TABLE IF NOT EXISTS clip_chunks (
+              job_id TEXT NOT NULL,
+              clip_seq INTEGER NOT NULL,
+              chunk_idx INTEGER NOT NULL,
+              data BLOB NOT NULL,
+              PRIMARY KEY (job_id, clip_seq, chunk_idx)
+            )`,
+            args: [],
+          },
           { sql: `CREATE INDEX IF NOT EXISTS idx_jobs_expires ON jobs (expires_at)`, args: [] },
         ],
         "write",
       )
+      .then(() => migrateExisting())
       .catch((e) => {
         schemaReady = null;
         throw e;
       });
   }
   return schemaReady;
+}
+
+/** ترحيل القواعد القائمة سابقًا: إضافة عمودي type و params_json إلى jobs (يتجاهل الخطأ إن ووجدا) */
+let migrated = false;
+async function migrateExisting() {
+  if (migrated) return;
+  for (const col of ["type TEXT DEFAULT 'merge'", "params_json TEXT DEFAULT '{}'"]) {
+    const name = col.split(" ")[0];
+    try {
+      await db.execute({ sql: `ALTER TABLE jobs ADD COLUMN ${col}`, args: [] });
+    } catch (e) {
+      if (!String(e?.message ?? "").includes("duplicate column")) {
+        // خطأ آخر غير "العمود موجود" — نسجله ونتابع (قد يكون عمودًا أُضيف للتو عبر مسار آخر)
+        console.warn(`[db] ترحيل العمود ${name}: ${String(e?.message ?? e)}`);
+      }
+    }
+  }
+  migrated = true;
 }
 
 const nowIso = () => new Date().toISOString();
@@ -94,8 +126,14 @@ function rowToJob(r) {
   try {
     sources = JSON.parse(o.sources_json || "[]");
   } catch {}
+  let params = {};
+  try {
+    params = JSON.parse(o.params_json || "{}");
+  } catch {}
   return {
     id: String(o.id),
+    type: String(o.type ?? "merge"),
+    params,
     status: String(o.status),
     progress: Number(o.progress ?? 0),
     sources,
@@ -110,14 +148,14 @@ function rowToJob(r) {
 
 /* ===== المهام ===== */
 
-async function createJob(sources) {
+async function createJob(sources, type = "merge", params = {}) {
   await ensureSchema();
   const id = Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 6); // معرف قصير قابل للمشاركة
   const created = nowIso();
   const expiresAt = expiresAtIso();
   await db.execute({
-    sql: `INSERT INTO jobs (id, status, progress, sources_json, expires_at, created_at) VALUES (?, 'queued', 0, ?, ?, ?)`,
-    args: [id, JSON.stringify(sources), expiresAt, created],
+    sql: `INSERT INTO jobs (id, status, progress, sources_json, expires_at, created_at, type, params_json) VALUES (?, 'queued', 0, ?, ?, ?, ?, ?)`,
+    args: [id, JSON.stringify(sources), expiresAt, created, type, JSON.stringify(params)],
   });
   for (let i = 0; i < sources.length; i++) {
     const s = sources[i];
@@ -172,7 +210,7 @@ async function purgeExpiredJobs() {
   return { scanned: ids.length, deleted };
 }
 
-/** حذف شامل في batch واحد: jobs + sources + source_chunks + output_chunks */
+/** حذف شامل في batch واحد: jobs + sources + source_chunks + clip_chunks + output_chunks */
 async function deleteJobCascade(id) {
   await ensureSchema();
   const check = await db.execute({ sql: `SELECT 1 FROM jobs WHERE id = ?`, args: [id] });
@@ -181,6 +219,7 @@ async function deleteJobCascade(id) {
     [
       { sql: `DELETE FROM source_chunks WHERE job_id = ?`, args: [id] },
       { sql: `DELETE FROM output_chunks WHERE job_id = ?`, args: [id] },
+      { sql: `DELETE FROM clip_chunks WHERE job_id = ?`, args: [id] },
       { sql: `DELETE FROM sources WHERE job_id = ?`, args: [id] },
       { sql: `DELETE FROM jobs WHERE id = ?`, args: [id] },
     ],
@@ -262,6 +301,63 @@ async function saveOutput(jobId, filePath) {
   const fs = require("node:fs");
   const buffer = fs.readFileSync(filePath);
   return insertBlobRows("output_chunks", ["job_id"], [jobId], 0, buffer);
+}
+
+/* ===== مقاطع العرض الصوري الوسيطة (clip_chunks) ===== */
+
+/** حفظ مقطع صورة معالَج (Buffer ≤ ~10MB) — يستبدل أي نسخة سابقة لنفس seq (قابل للتكرار). يعيد الحجم بالبايت */
+async function saveClip(jobId, clipSeq, buffer) {
+  await ensureSchema();
+  await db.batch(
+    [{ sql: `DELETE FROM clip_chunks WHERE job_id = ? AND clip_seq = ?`, args: [jobId, clipSeq] }],
+    "write",
+  );
+  await insertBlobRows("clip_chunks", ["job_id", "clip_seq"], [jobId, clipSeq], 0, buffer);
+  return buffer.length;
+}
+
+async function clipBytes(jobId, clipSeq) {
+  const res = await db.execute({
+    sql: `SELECT COALESCE(SUM(length(data)), 0) AS bytes FROM clip_chunks WHERE job_id = ? AND clip_seq = ?`,
+    args: [jobId, clipSeq],
+  });
+  return Number(res.rows[0].bytes ?? 0);
+}
+
+/** قائمة المقاطع الجاهزة: [{seq, bytes}] مرتبة */
+async function listClips(jobId) {
+  await ensureSchema();
+  const res = await db.execute({
+    sql: `SELECT clip_seq, COALESCE(SUM(length(data)), 0) AS bytes FROM clip_chunks WHERE job_id = ? GROUP BY clip_seq ORDER BY clip_seq`,
+    args: [jobId],
+  });
+  return res.rows.map((r) => ({ seq: Number(r.clip_seq), bytes: Number(r.bytes ?? 0) }));
+}
+
+/** تجميع مقطع من صفوفه إلى /tmp — يعيد المسار أو null إن لم يوجد */
+async function assembleClip(jobId, clipSeq, destPath) {
+  await ensureSchema();
+  const bytes = await clipBytes(jobId, clipSeq);
+  if (bytes <= 0) return null;
+  const fs = require("node:fs");
+  const fd = fs.openSync(destPath, "w");
+  try {
+    let lastIdx = 0;
+    for (;;) {
+      const page = await db.execute({
+        sql: `SELECT chunk_idx, data FROM clip_chunks WHERE job_id = ? AND clip_seq = ? AND chunk_idx >= ? ORDER BY chunk_idx LIMIT ${LIMITS.BLOB_PAGE_ROWS}`,
+        args: [jobId, clipSeq, lastIdx],
+      });
+      if (page.rows.length === 0) break;
+      for (const r of page.rows) {
+        fs.writeSync(fd, Buffer.from(r.data));
+        lastIdx = Number(r.chunk_idx) + 1;
+      }
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return destPath;
 }
 
 async function outputSize(jobId) {
@@ -348,5 +444,9 @@ module.exports = {
   outputSize,
   outputChunkCount,
   readOutputStream,
+  saveClip,
+  clipBytes,
+  listClips,
+  assembleClip,
   nowIso,
 };

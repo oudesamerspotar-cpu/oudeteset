@@ -9,9 +9,26 @@
  */
 import { classifyProviderError, isKeyRelatedFailure, ProviderError } from "@/lib/errors";
 import { maskKey } from "@/lib/keys";
-import { defaultModelFor, MERGE_MODEL, type ModelDef, normalizeModel, type MediaType } from "@/lib/models";
+import {
+  defaultModelFor,
+  MERGE_MODEL,
+  SLIDESHOW_MODEL,
+  type ModelDef,
+  normalizeModel,
+  type MediaType,
+} from "@/lib/models";
 import { getAdapter, type ProviderInput } from "@/lib/providers";
-import { createMergeJob, getMergeJob, processMergeJob, MergerError } from "@/lib/merger";
+import {
+  createMergeJob,
+  createSlideshowJob,
+  getMergeJob,
+  getSlideshowJob,
+  mergeSlideshow,
+  processMergeJob,
+  processSlideshowClip,
+  MergerError,
+  type SlideshowJobStatus,
+} from "@/lib/merger";
 import {
   bumpKeyCounters,
   getKeyPool,
@@ -439,6 +456,246 @@ export async function runMerge(
 /** قفل الذاكرة processInFlight — يمنع تزامن process مع get_task */
 const processInFlight = new Set<string>();
 
+/* ===== العرض الصوري (صور ← فيديو رأسي 9:16 بتحريك خفيف — بلا أي API مدفوع) ===== */
+
+// كل استدعاء get_task يقود خطوة معالجة بميزانية زمنية — يبقي الرد سريعًا ويتقدم العمل
+const SLIDESHOW_STEP_BUDGET_MS = 45_000;
+
+/** تقدم العرض الصوري: الإنشاء 0–5، المقاطع 40–90، الدمج 90–100 */
+function slideshowProgress(readyCount: number, total: number): number {
+  if (total <= 0) return 0;
+  return Math.max(0, Math.min(100, 40 + Math.round((readyCount / total) * 50)));
+}
+
+function isServiceDeclaredError(err: unknown): boolean {
+  return err instanceof MergerError ? err.status !== 0 : false;
+}
+
+/**
+ * قيادة مهمة العرض الصوري حتى سقف زمني: يعالج المقاطع الناقصة بالترتيب ثم يدمج.
+ * أخطاء الخدمة المعلنة → فشل نهائي؛ أخطاء شبكتنا → تبقى processing وتُستأنف مع get_task.
+ */
+async function driveSlideshow(
+  taskId: string,
+  deadlineMs: number,
+  notify?: ProgressNotify,
+  signal?: AbortSignal,
+): Promise<TaskRow> {
+  for (;;) {
+    if (signal?.aborted || Date.now() >= deadlineMs) break;
+    const task = await getTaskOrThrow(taskId);
+    if (task.status === "completed" || task.status === "failed") return task;
+    const jobId = task.providerTaskId;
+    if (!jobId) break;
+
+    const params = internalParams(task);
+    const images = (params.images as string[] | undefined) ?? [];
+    const clipSeconds = Number(params.clip_seconds) || 15;
+
+    let st: SlideshowJobStatus;
+    try {
+      st = await getSlideshowJob(jobId);
+    } catch (err) {
+      if (isServiceDeclaredError(err)) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await updateTask(taskId, { status: "failed", errorMessage: `فشل العرض الصوري: ${msg.slice(0, 300)}` });
+        return await getTaskOrThrow(taskId);
+      }
+      break; // خطأ شبكتنا نحن — ننتظر دورة قادمة
+    }
+
+    if (st.status === "done" && st.videoUrl) {
+      await updateTask(taskId, { status: "completed", progress: 100, resultUrls: [st.videoUrl], errorMessage: null });
+      return await getTaskOrThrow(taskId);
+    }
+    if (st.status === "failed") {
+      await updateTask(taskId, { status: "failed", errorMessage: `فشل العرض الصوري: ${(st.error ?? "بدون رسالة").slice(0, 300)}` });
+      return await getTaskOrThrow(taskId);
+    }
+    if (st.status === "missing") {
+      // المهمة اختفت من الخدمة (تجاوزت 24 ساعة أو فُقدت) → إعادة إنشاء بعد تهدئة بنفس task_id
+      const nextAt = params._nextAttemptAt ? Date.parse(String(params._nextAttemptAt)) : 0;
+      if (Date.now() >= nextAt && images.length >= 4) {
+        try {
+          const job = await createSlideshowJob(images, clipSeconds);
+          await updateTask(taskId, {
+            providerTaskId: job.jobId,
+            status: "processing",
+            progress: 5,
+            errorMessage: null,
+            paramsJson: mergeParams(task, { _nextAttemptAt: undefined }),
+          });
+          continue;
+        } catch (err) {
+          if (isServiceDeclaredError(err)) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await updateTask(taskId, { status: "failed", errorMessage: `فشل العرض الصوري: ${msg.slice(0, 300)}` });
+            return await getTaskOrThrow(taskId);
+          }
+          await updateTask(taskId, { paramsJson: mergeParams(task, { _nextAttemptAt: new Date(Date.now() + RETRY_COOLDOWN_MS).toISOString() }) });
+          break;
+        }
+      }
+      break;
+    }
+
+    const missing = st.clips.filter((c) => !c.ready).map((c) => c.seq).sort((a, b) => a - b);
+    const baseProgress = Math.max(task.progress, slideshowProgress(st.clipsReady, st.imageCount));
+
+    if (missing.length === 0) {
+      // كل المقاطع جاهزة → الدمج النهائي (-c copy سريع)
+      notify?.(Math.max(baseProgress, 90), 100, `دمج ${st.imageCount} مقاطع في فيديو واحد…`);
+      try {
+        const merged = await mergeSlideshow(jobId);
+        const urls = merged.downloadUrl && merged.downloadUrl !== merged.videoUrl ? [merged.videoUrl, merged.downloadUrl] : [merged.videoUrl];
+        await updateTask(taskId, { status: "completed", progress: 100, resultUrls: urls, errorMessage: null });
+        return await getTaskOrThrow(taskId);
+      } catch (err) {
+        if (isServiceDeclaredError(err)) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await updateTask(taskId, { status: "failed", errorMessage: `فشل العرض الصوري: ${msg.slice(0, 300)}` });
+          return await getTaskOrThrow(taskId);
+        }
+        break;
+      }
+    }
+
+    // معالجة الصورة الناقصة التالية (تحريك خفيف 9:16 لكل صورة)
+    const seq = missing[0];
+    notify?.(baseProgress, 100, `معالجة الصورة ${seq + 1} من ${st.imageCount} — مقطع ${st.clipSeconds} ثانية رأسي 9:16…`);
+    try {
+      await processSlideshowClip(jobId, seq);
+      const st2 = await getSlideshowJob(jobId);
+      await updateTask(taskId, {
+        status: "processing",
+        progress: Math.max(baseProgress, slideshowProgress(st2.clipsReady, st2.imageCount)),
+      });
+    } catch (err) {
+      if (isServiceDeclaredError(err)) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await updateTask(taskId, { status: "failed", errorMessage: `فشل العرض الصوري: ${msg.slice(0, 300)}` });
+        return await getTaskOrThrow(taskId);
+      }
+      break; // شبكتنا — تُستأنف الصورة نفسها في الدورة القادمة (clip قابل لإعادة التنفيذ)
+    }
+  }
+  return await getTaskOrThrow(taskId);
+}
+
+/**
+ * التدفق الكامل لأداة images_to_video — تحويل 4 إلى 8 صور إلى فيديو واحد رأسي 9:16 (مقطع 15 ثانية لكل صورة
+ * بتحريك خفيف + دمج نهائي) عبر خدمة الدمج المحلية بلا أي API مدفوع.
+ * يقبل images (روابط مباشرة) أو task_ids (مهام صور مكتملة تُحل روابطها من قاعدة البيانات).
+ */
+export async function runImagesToVideo(
+  args: { images?: string[]; task_ids?: string[]; clip_seconds?: number; wait_seconds?: number },
+  notify?: ProgressNotify,
+  signal?: AbortSignal,
+): Promise<RunResult> {
+  const invalidTaskIds: string[] = [];
+  const resolved: string[] = [];
+
+  // روابط task_ids أولًا ثم urls المباشرة بنفس ترتيبها — نفس نمط merge_videos
+  for (const tid of args.task_ids ?? []) {
+    const t = await getTask(tid);
+    if (t && t.type === "image" && t.status === "completed" && t.resultUrls && t.resultUrls.length > 0) {
+      resolved.push(...t.resultUrls);
+    } else {
+      invalidTaskIds.push(
+        !t ? `${tid}: غير موجود` : t.status !== "completed" ? `${tid}: الحالة ${t.status} (يلزم مكتملة)` : `${tid}: بلا روابط نتائج`,
+      );
+    }
+  }
+  for (const u of args.images ?? []) resolved.push(String(u).trim());
+  const images = [...new Set(resolved.filter((u) => u.length > 0))];
+
+  const ghostFail = (msg: string): RunResult => ({
+    task: { id: "-", status: "failed", type: "slideshow", errorMessage: msg } as unknown as TaskRow,
+  });
+
+  if (images.length < 4) {
+    let msg = "❌ العرض الصوري يحتاج 4 صور على الأقل. مرّر images (روابط صور مباشرة) أو task_ids لمهام صور مكتملة.";
+    if (invalidTaskIds.length > 0) msg += "\n\nتفاصيل المعرفات غير الصالحة:\n- " + invalidTaskIds.join("\n- ");
+    return ghostFail(msg);
+  }
+  if (images.length > 8) {
+    return ghostFail("❌ أقصى عدد صور للعرض الصوري هو 8 — خفّض القائمة وأعد المحاولة.");
+  }
+  const badUrl = images.find((u) => !/^https?:\/\/\S+/.test(u));
+  if (badUrl) {
+    return ghostFail("❌ روابط الصور يجب أن تكون روابط مباشرة عامة (http/https).");
+  }
+  let clipSeconds = 15;
+  if (args.clip_seconds !== undefined) {
+    const cs = Number(args.clip_seconds);
+    if (!Number.isFinite(cs) || cs < 5 || cs > 20) {
+      return ghostFail("❌ clip_seconds يجب أن يكون بين 5 و 20 ثانية لكل صورة.");
+    }
+    clipSeconds = Math.round(cs);
+  }
+
+  const taskId = randomUUID();
+  await insertTask({
+    id: taskId,
+    type: "slideshow",
+    model: SLIDESHOW_MODEL,
+    prompt: `عرض صوري من ${images.length} صور — مقاطع ${clipSeconds} ثانية رأسي 9:16 بتحريك خفيف`,
+    paramsJson: JSON.stringify({ images, clip_seconds: clipSeconds, wait_seconds: args.wait_seconds ?? 240 }),
+    provider: "merger",
+    status: "pending",
+  });
+
+  try {
+    const job = await createSlideshowJob(images, clipSeconds);
+    await updateTask(taskId, { status: "processing", provider: "merger", providerTaskId: job.jobId, progress: 5 });
+  } catch (err) {
+    if (isServiceDeclaredError(err)) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await updateTask(taskId, { status: "failed", errorMessage: `فشل إنشاء مهمة العرض الصوري: ${msg.slice(0, 300)}` });
+    } else {
+      // شبكتنا → مؤقت: تُعاد المحاولة مع get_task بعد التهدئة
+      const current = await getTask(taskId);
+      if (current) {
+        await updateTask(taskId, {
+          errorMessage: "تعذر الوصول إلى خدمة الدمج مؤقتًا — ستُعاد المحاولة تلقائيًا.",
+          paramsJson: mergeParams(current, { _nextAttemptAt: new Date(Date.now() + RETRY_COOLDOWN_MS).toISOString() }),
+        });
+      }
+    }
+    return { task: (await getTask(taskId))! };
+  }
+
+  const waitSeconds = Math.min(240, Math.max(0, args.wait_seconds ?? 240));
+  const task = await driveSlideshow(taskId, Date.now() + waitSeconds * 1000, notify, signal);
+  return { task };
+}
+
+/** تحديث مهمة عرض صوري جارية من الخدمة — يُستدعى من get_task ويعالج خطوة واحدة على الأقل */
+async function refreshSlideshowTask(task: TaskRow): Promise<TaskRow> {
+  if (!task.providerTaskId) {
+    // لم تُنشأ لدى الخدمة أصلًا (فشل شبكة عند الإنشاء) → إعادة إنشاء بعد التهدئة
+    const params = internalParams(task);
+    const nextAt = params._nextAttemptAt ? Date.parse(String(params._nextAttemptAt)) : 0;
+    if (Date.now() < nextAt) return task;
+    const images = (params.images as string[] | undefined) ?? [];
+    if (images.length < 4) return task;
+    const clipSeconds = Number(params.clip_seconds) || 15;
+    try {
+      const job = await createSlideshowJob(images, clipSeconds);
+      await updateTask(task.id, { status: "processing", provider: "merger", providerTaskId: job.jobId, progress: 5, errorMessage: null });
+    } catch (err) {
+      if (isServiceDeclaredError(err)) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await updateTask(task.id, { status: "failed", errorMessage: `فشل العرض الصوري: ${msg.slice(0, 300)}` });
+      } else {
+        await updateTask(task.id, { paramsJson: mergeParams(task, { _nextAttemptAt: new Date(Date.now() + RETRY_COOLDOWN_MS).toISOString() }) });
+      }
+      return (await getTask(task.id))!;
+    }
+  }
+  return driveSlideshow(task.id, Date.now() + SLIDESHOW_STEP_BUDGET_MS);
+}
+
 async function fireProcessOnce(task: TaskRow, force = false): Promise<void> {
   if (!task.providerTaskId) return;
   if (processInFlight.has(task.id) && !force) return;
@@ -574,6 +831,7 @@ export async function refreshTask(taskId: string, notify?: ProgressNotify, signa
   if (task.status === "completed" || task.status === "failed") return { task };
 
   if (task.type === "merge") return { task: await refreshMergeTask(task) };
+  if (task.type === "slideshow") return { task: await refreshSlideshowTask(task) };
 
   // صور/فيديو
   if (task.providerTaskId && task.provider) {

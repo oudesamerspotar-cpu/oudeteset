@@ -16,6 +16,10 @@ module.exports = async (req, res) => {
 
   const job = await store.getJob(jobId);
   if (!job) return sendError(res, 404, "المهمة غير موجودة (حُذفت أو انتهت صلاحيتها بعد 24 ساعة)");
+  // مهام العرض الصوري لها مسار تنفيذ خاص بها (مقطع لكل صورة ثم دمج) — لا تمر من هنا
+  if (job.type === "slideshow") {
+    return sendError(res, 400, 'مهمة عرض صوري — استخدم POST /api/slideshow/{id}/clip?seq=<k> لكل صورة ثم POST /api/slideshow/{id}/merge');
+  }
 
   if (job.status === "processing") return sendJson(res, 202, { status: "processing", progress: job.progress });
   if (job.status === "done") {

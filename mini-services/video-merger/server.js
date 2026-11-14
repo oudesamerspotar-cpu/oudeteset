@@ -19,6 +19,10 @@ const videoHandler = require("./api/jobs/[id]/video");
 const uploadHandler = require("./api/upload");
 const configHandler = require("./api/config");
 const cronHandler = require("./api/cron");
+const slideshowHandler = require("./api/slideshow");
+const slideshowIdHandler = require("./api/slideshow/[id]");
+const slideshowClipHandler = require("./api/slideshow/[id]/clip");
+const slideshowMergeHandler = require("./api/slideshow/[id]/merge");
 
 const PORT = Number(process.env.PORT || 4000);
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -50,6 +54,27 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/upload") return await uploadHandler(req, res);
     if (p === "/api/config") return await configHandler(req, res);
     if (p === "/api/cron") return await cronHandler(req, res);
+    if (p === "/api/slideshow") return await slideshowHandler(req, res);
+
+    // /api/slideshow/<id>/clip و /merge
+    let m2;
+    m2 = /^\/api\/slideshow\/([^/]+)\/clip$/.exec(p);
+    if (m2) {
+      req.query.id = decodeURIComponent(m2[1]);
+      return await slideshowClipHandler(req, res);
+    }
+    m2 = /^\/api\/slideshow\/([^/]+)\/merge$/.exec(p);
+    if (m2) {
+      req.query.id = decodeURIComponent(m2[1]);
+      return await slideshowMergeHandler(req, res);
+    }
+
+    // /api/slideshow/<id>
+    m2 = /^\/api\/slideshow\/([^/]+)$/.exec(p);
+    if (m2) {
+      req.query.id = decodeURIComponent(m2[1]);
+      return await slideshowIdHandler(req, res);
+    }
 
     // /api/jobs/<id>/process و /video
     let m = /^\/api\/jobs\/([^/]+)\/process$/.exec(p);
