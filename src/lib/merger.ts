@@ -76,8 +76,10 @@ export interface SlideshowJobCreated {
 export interface SlideshowClipState {
   seq: number;
   name: string;
+  kind: "prompt" | "url" | "file";
   ready: boolean;
   size: number;
+  imageReady: boolean;
 }
 
 export interface SlideshowJobStatus {
@@ -86,6 +88,7 @@ export interface SlideshowJobStatus {
   imageCount: number;
   clipSeconds: number;
   clipsReady: number;
+  imagesReady: number;
   clips: SlideshowClipState[];
   videoUrl?: string;
   error?: string;
@@ -109,6 +112,65 @@ export async function createSlideshowJob(imageUrls: string[], clipSeconds = 15):
     clipSeconds: Number(body.clipSeconds ?? clipSeconds),
     expiresAt: body.expiresAt as string | undefined,
   };
+}
+
+/** إنشاء مهمة عرض صوري من أوصاف مشاهد نصية — كل وصف تولَّد صورته من خدمة مجانية بلا مفتاح (Pollinations) */
+export async function createSlideshowFromPrompts(prompts: string[], clipSeconds = 15): Promise<SlideshowJobCreated> {
+  const { status, body } = await mergerFetch(`${MERGER_BASE}/api/slideshow`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompts, clip_seconds: clipSeconds }),
+  }, 20_000);
+  if (status < 200 || status >= 300) {
+    throw new MergerError(status, String(body.error ?? body.message ?? `HTTP ${status}`));
+  }
+  const jobId = body.jobId as string | undefined;
+  if (!jobId) throw new MergerError(500, "استجابة إنشاء مهمة العرض الصوري بلا jobId");
+  return {
+    jobId,
+    imageCount: Number(body.imageCount ?? prompts.length),
+    clipSeconds: Number(body.clipSeconds ?? clipSeconds),
+    expiresAt: body.expiresAt as string | undefined,
+  };
+}
+
+/** نتيجة خطوة توليد صورة مشهد (لمصادر prompts) — مُميَّز بمفتاح state ودون رميات */
+export type SlideshowImageStepResult =
+  | { state: "ok"; cached: boolean; size?: number }
+  | { state: "rateLimited"; retryAfter: number }
+  | { state: "serviceDown"; message: string }
+  | { state: "mergerError"; status: number; message: string }
+  | { state: "networkError"; message: string };
+
+/**
+ * توليد صورة مشهد من وصفه (خدمة مجانية بلا مفتاح) وتخزينها لدى خدمة الدمج.
+ * مهلة طويرة لأن الخدمة قد تنتظر داخليًا حد الخدمة المجاني (~45 ثانية) ثم تولّد.
+ * لا ترمي أبدًا — كل الحالات في النوع Union ليتقرر مصير المهمة في المُستدعي بوضوح.
+ */
+export async function generateSlideshowImage(jobId: string, seq: number): Promise<SlideshowImageStepResult> {
+  let status: number;
+  let body: Record<string, unknown>;
+  try {
+    const r = await mergerFetch(
+      `${MERGER_BASE}/api/slideshow/${encodeURIComponent(jobId)}/image?seq=${seq}`,
+      { method: "POST" },
+      150_000,
+    );
+    status = r.status;
+    body = r.body;
+  } catch (e) {
+    return { state: "networkError", message: e instanceof Error ? e.message : String(e) };
+  }
+  if (status === 429) {
+    return { state: "rateLimited", retryAfter: Number(body.retryAfter) > 0 ? Number(body.retryAfter) : 45 };
+  }
+  if (status === 503) {
+    return { state: "serviceDown", message: String(body.error ?? "خدمة توليد الصور المجانية غير متاحة حاليًا") };
+  }
+  if (status >= 400) {
+    return { state: "mergerError", status, message: String(body.error ?? `HTTP ${status}`) };
+  }
+  return { state: "ok", cached: Boolean(body.cached), size: typeof body.size === "number" ? body.size : undefined };
 }
 
 /** معالجة صورة واحدة: تحويلها لمقطع بتحريك خفيف (يستغرق ~5–40 ثانية لكل صورة) */
@@ -146,7 +208,7 @@ export async function mergeSlideshow(jobId: string): Promise<{ videoUrl: string;
 export async function getSlideshowJob(jobId: string): Promise<SlideshowJobStatus> {
   const { status, body } = await mergerFetch(`${MERGER_BASE}/api/slideshow/${encodeURIComponent(jobId)}`, { method: "GET" }, 15_000);
   if (status === 404) {
-    return { status: "missing", progress: 0, imageCount: 0, clipSeconds: 15, clipsReady: 0, clips: [], error: "مهمة العرض الصوري غير موجودة (حُذفت أو انتهت صلاحيتها بعد 24 ساعة)" };
+    return { status: "missing", progress: 0, imageCount: 0, clipSeconds: 15, clipsReady: 0, imagesReady: 0, clips: [], error: "مهمة العرض الصوري غير موجودة (حُذفت أو انتهت صلاحيتها بعد 24 ساعة)" };
   }
   if (status >= 400) {
     throw new MergerError(status, String(body.error ?? body.message ?? `HTTP ${status}`));
@@ -158,9 +220,12 @@ export async function getSlideshowJob(jobId: string): Promise<SlideshowJobStatus
     imageCount: Number(body.imageCount ?? clips.length),
     clipSeconds: Number(body.clipSeconds ?? 15),
     clipsReady: Number(body.clipsReady ?? 0),
+    imagesReady: Number(body.imagesReady ?? 0),
     clips: clips.map((c) => ({
       seq: Number(c.seq ?? 0),
       name: String(c.name ?? ""),
+      kind: c.kind === "prompt" ? "prompt" : c.kind === "file" ? "file" : "url",
+      imageReady: c.kind === "prompt" ? Boolean(c.imageReady) : true,
       ready: Boolean(c.ready),
       size: Number(c.size ?? 0),
     })),

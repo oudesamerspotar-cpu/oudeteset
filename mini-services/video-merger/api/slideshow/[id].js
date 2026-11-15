@@ -32,22 +32,36 @@ module.exports = async (req, res) => {
 
   const n = job.sources.length;
   const clips = await store.listClips(job.id);
+  const base = baseUrlOf(req);
   const clipStates = [];
   for (let i = 0; i < n; i++) {
     const c = clips.find((x) => x.seq === i);
-    clipStates.push({ seq: i, name: job.sources[i]?.name ?? `صورة ${i + 1}`, ready: Boolean(c && c.bytes > 0), size: c?.bytes ?? 0 });
+    const kind = job.sources[i]?.kind ?? "url";
+    // لمشاهد prompts: حالة توليد الصورة (source_chunks) قبل حالة المقطع (clip_chunks)
+    const imageBytes = kind === "prompt" ? (await store.sourceChunkCount(job.id, i)).bytes : 0;
+    clipStates.push({
+      seq: i,
+      kind,
+      name: job.sources[i]?.name ?? `صورة ${i + 1}`,
+      imageReady: kind === "prompt" ? imageBytes > 0 : true,
+      imageGenUrl: kind === "prompt" ? `${base}/api/slideshow/${job.id}/image?seq=${i}` : null,
+      ready: Boolean(c && c.bytes > 0),
+      size: c?.bytes ?? 0,
+    });
   }
 
-  const base = baseUrlOf(req);
   const out = {
     jobId: job.id,
     type: "slideshow",
+    mode: job.params?.mode === "prompts" ? "prompts" : "media",
     status: job.status,
     progress: job.progress,
     imageCount: n,
     clipSeconds: Number(job.params?.clipSeconds) || 15,
     clipsReady: clipStates.filter((c) => c.ready).length,
+    imagesReady: clipStates.filter((c) => c.imageReady).length,
     clips: clipStates,
+    imageUrl: `${base}/api/slideshow/${job.id}/image?seq=<k>`,
     clipUrl: `${base}/api/slideshow/${job.id}/clip?seq=<k>`,
     mergeUrl: `${base}/api/slideshow/${job.id}/merge`,
     expiresAt: job.expiresAt,

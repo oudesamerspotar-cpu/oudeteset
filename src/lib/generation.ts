@@ -20,13 +20,16 @@ import {
 import { getAdapter, type ProviderInput } from "@/lib/providers";
 import {
   createMergeJob,
+  createSlideshowFromPrompts,
   createSlideshowJob,
+  generateSlideshowImage,
   getMergeJob,
   getSlideshowJob,
   mergeSlideshow,
   processMergeJob,
   processSlideshowClip,
   MergerError,
+  SlideshowImageStepResult,
   type SlideshowJobStatus,
 } from "@/lib/merger";
 import {
@@ -490,6 +493,7 @@ async function driveSlideshow(
 
     const params = internalParams(task);
     const images = (params.images as string[] | undefined) ?? [];
+    const prompts = (params.prompts as string[] | undefined) ?? [];
     const clipSeconds = Number(params.clip_seconds) || 15;
 
     let st: SlideshowJobStatus;
@@ -514,10 +518,11 @@ async function driveSlideshow(
     }
     if (st.status === "missing") {
       // المهمة اختفت من الخدمة (تجاوزت 24 ساعة أو فُقدت) → إعادة إنشاء بعد تهدئة بنفس task_id
+      const canRecreate = prompts.length >= 4 || images.length >= 4;
       const nextAt = params._nextAttemptAt ? Date.parse(String(params._nextAttemptAt)) : 0;
-      if (Date.now() >= nextAt && images.length >= 4) {
+      if (Date.now() >= nextAt && canRecreate) {
         try {
-          const job = await createSlideshowJob(images, clipSeconds);
+          const job = prompts.length >= 4 ? await createSlideshowFromPrompts(prompts, clipSeconds) : await createSlideshowJob(images, clipSeconds);
           await updateTask(taskId, {
             providerTaskId: job.jobId,
             status: "processing",
@@ -560,9 +565,34 @@ async function driveSlideshow(
       }
     }
 
-    // معالجة الصورة الناقصة التالية (تحريك خفيف 9:16 لكل صورة)
+    // معالجة المشهد الناقص التالية بالترتيب: توليد الصورة أولًا لمشاهد prompts ثم التحريك والترميز
     const seq = missing[0];
-    notify?.(baseProgress, 100, `معالجة الصورة ${seq + 1} من ${st.imageCount} — مقطع ${st.clipSeconds} ثانية رأسي 9:16…`);
+    const clipState = st.clips.find((c) => c.seq === seq);
+    if (clipState?.kind === "prompt" && !clipState.imageReady) {
+      notify?.(baseProgress, 100, `توليد صورة المشهد ${seq + 1} من ${st.imageCount} (خدمة صور مجانية بلا مفتاح)…`);
+      const img = await generateSlideshowImage(jobId, seq);
+      if (img.state === "networkError") break; // شبكتنا نحو خدمة الدمج — تُستأنف مع get_task
+      if (img.state === "mergerError") {
+        await updateTask(taskId, { status: "failed", errorMessage: `فشل العرض الصوري: ${img.message.slice(0, 300)}` });
+        return await getTaskOrThrow(taskId);
+      }
+      if (img.state === "rateLimited") {
+        // حد الخدمة المجانية (~صورة كل 45 ثانية لكل IP): ننتظر داخل نافذة الانتظار ثم نعيد نفس المشهد
+        const waitMs = Math.min(img.retryAfter * 1000 + 1_000, Math.max(0, deadlineMs - Date.now()));
+        if (waitMs > 2_000) {
+          notify?.(baseProgress, 100, `انتظار حد الخدمة المجانية لتوليد الصور (~${Math.round(waitMs / 1000)} ثانية)…`);
+          await sleep(waitMs);
+          continue; // دورة جديدة على نفس المشهد (الرابط حتمي — قد يعاد من الذاكرة المؤقتة)
+        }
+        break; // انتهت نافذة الانتظار — تبقى processing وتُستأنف مع get_task
+      }
+      if (img.state === "serviceDown") {
+        // خدمة التوليد المجانية غير متاحة — المهمة تبقى processing وتُستأنف تلقائيًا مع get_task
+        await updateTask(taskId, { status: "processing", errorMessage: img.message.slice(0, 300) });
+        break;
+      }
+    }
+    notify?.(baseProgress, 100, `معالجة المشهد ${seq + 1} من ${st.imageCount} — مقطع ${st.clipSeconds} ثانية رأسي 9:16…`);
     try {
       await processSlideshowClip(jobId, seq);
       const st2 = await getSlideshowJob(jobId);
@@ -583,17 +613,53 @@ async function driveSlideshow(
 }
 
 /**
- * التدفق الكامل لأداة images_to_video — تحويل 4 إلى 8 صور إلى فيديو واحد رأسي 9:16 (مقطع 15 ثانية لكل صورة
+ * التدفق الكامل لأداة images_to_video — تحويل 4 إلى 8 مشاهد/صور إلى فيديو واحد رأسي 9:16 (مقطع 15 ثانية لكل مشهد
  * بتحريك خفيف + دمج نهائي) عبر خدمة الدمج المحلية بلا أي API مدفوع.
- * يقبل images (روابط مباشرة) أو task_ids (مهام صور مكتملة تُحل روابطها من قاعدة البيانات).
+ * ثلاثة مداخل بالأولوية: prompts (أوصاف مشاهد تُولَّد صورها من خدمة مجانية بلا مفتاح — Pollinations)
+ * ثم images (روابط مباشرة) ثم task_ids (مهام صور مكتملة تُحل روابطها من قاعدة البيانات).
  */
 export async function runImagesToVideo(
-  args: { images?: string[]; task_ids?: string[]; clip_seconds?: number; wait_seconds?: number },
+  args: { prompts?: string[]; images?: string[]; task_ids?: string[]; clip_seconds?: number; wait_seconds?: number },
   notify?: ProgressNotify,
   signal?: AbortSignal,
 ): Promise<RunResult> {
   const invalidTaskIds: string[] = [];
   const resolved: string[] = [];
+
+  const ghostFail = (msg: string): RunResult => ({
+    task: { id: "-", status: "failed", type: "slideshow", errorMessage: msg } as unknown as TaskRow,
+  });
+
+  // وضع "مشاهد نصية": prompts تتفرد (أولوية قصوى) ولا تُقبل مع images/task_ids معًا
+  const promptsRaw = (args.prompts ?? []).map((p) => String(p ?? "").trim()).filter((p) => p.length > 0);
+  const prompts = [...new Set(promptsRaw)];
+  const wantsMedia = Array.isArray(args.images) || Array.isArray(args.task_ids);
+  if (prompts.length > 0 && wantsMedia) {
+    return ghostFail("❌ مرر prompts (أوصاف مشاهد) أو images/task_ids (صور جاهزة) — ليس الاثنين معًا.");
+  }
+
+  let clipSeconds = 15;
+  if (args.clip_seconds !== undefined) {
+    const cs = Number(args.clip_seconds);
+    if (!Number.isFinite(cs) || cs < 5 || cs > 20) {
+      return ghostFail("❌ clip_seconds يجب أن يكون بين 5 و 20 ثانية لكل صورة.");
+    }
+    clipSeconds = Math.round(cs);
+  }
+
+  if (prompts.length > 0) {
+    if (prompts.length < 4) {
+      return ghostFail("❌ العرض الصوري يحتاج 4 مشاهد على الأقل — سطر/عنصر لكل مشهد. مررت " + prompts.length + ".");
+    }
+    if (prompts.length > 8) {
+      return ghostFail("❌ أقصى عدد مشاهد للعرض الصوري هو 8 — خفّض القائمة وأعد المحاولة.");
+    }
+    const short = prompts.find((p) => p.length < 3 || p.length > 600);
+    if (short) {
+      return ghostFail("❌ كل وصف مشهد يجب أن يكون نصًا بين 3 و 600 حرف.");
+    }
+    return runImagesToVideoFromPrompts(prompts, clipSeconds, args.wait_seconds, notify, signal, ghostFail);
+  }
 
   // روابط task_ids أولًا ثم urls المباشرة بنفس ترتيبها — نفس نمط merge_videos
   for (const tid of args.task_ids ?? []) {
@@ -609,12 +675,8 @@ export async function runImagesToVideo(
   for (const u of args.images ?? []) resolved.push(String(u).trim());
   const images = [...new Set(resolved.filter((u) => u.length > 0))];
 
-  const ghostFail = (msg: string): RunResult => ({
-    task: { id: "-", status: "failed", type: "slideshow", errorMessage: msg } as unknown as TaskRow,
-  });
-
   if (images.length < 4) {
-    let msg = "❌ العرض الصوري يحتاج 4 صور على الأقل. مرّر images (روابط صور مباشرة) أو task_ids لمهام صور مكتملة.";
+    let msg = "❌ العرض الصوري يحتاج 4 مشاهد/صور على الأقل. مرّر prompts (وصف نصي لكل مشهد) أو images (روابط صور مباشرة) أو task_ids لمهام صور مكتملة.";
     if (invalidTaskIds.length > 0) msg += "\n\nتفاصيل المعرفات غير الصالحة:\n- " + invalidTaskIds.join("\n- ");
     return ghostFail(msg);
   }
@@ -624,14 +686,6 @@ export async function runImagesToVideo(
   const badUrl = images.find((u) => !/^https?:\/\/\S+/.test(u));
   if (badUrl) {
     return ghostFail("❌ روابط الصور يجب أن تكون روابط مباشرة عامة (http/https).");
-  }
-  let clipSeconds = 15;
-  if (args.clip_seconds !== undefined) {
-    const cs = Number(args.clip_seconds);
-    if (!Number.isFinite(cs) || cs < 5 || cs > 20) {
-      return ghostFail("❌ clip_seconds يجب أن يكون بين 5 و 20 ثانية لكل صورة.");
-    }
-    clipSeconds = Math.round(cs);
   }
 
   const taskId = randomUUID();
@@ -670,6 +724,98 @@ export async function runImagesToVideo(
   return { task };
 }
 
+/** رسالة البديل الواضحة عندما تكون خدمة توليد الصور المجانية غير متاحة (بلا بادئة ❌ — صياغة formatFailed تضيفها) */
+function freeImagegenFallbackMessage(detail: string): string {
+  return (
+    `خدمة توليد الصور المجانية (Pollinations) غير متاحة الآن — ${detail}\n\n` +
+    "البديل (اختر واحدًا):\n" +
+    "1) أعد المحاولة بعد دقيقة تقريبًا — الحد المجاني ~صورة كل 45 ثانية لكل IP وقد يكون مستنزفًا مؤقتًا من مستخدمي نفس عنوان الخروج.\n" +
+    "2) ولّد الصور بنفسك بأداة generate_image (مفتاحك الحالي) ثم مررها إلى images_to_video عبر task_ids (مهام الصور المكتملة) أو images (روابط مباشرة).\n" +
+    "3) مرر images بأي روابط صور مباشرة عامة تملكها."
+  );
+}
+
+/** تدفق وضع المشاهد النصية: إنشاء مهمة prompts + فحص مسبق لتوليد أول مشهد + قيادة كاملة */
+async function runImagesToVideoFromPrompts(
+  prompts: string[],
+  clipSeconds: number,
+  waitSecondsArg: number | undefined,
+  notify: ProgressNotify | undefined,
+  signal: AbortSignal | undefined,
+  ghostFail: (msg: string) => RunResult,
+): Promise<RunResult> {
+  const taskId = randomUUID();
+  await insertTask({
+    id: taskId,
+    type: "slideshow",
+    model: SLIDESHOW_MODEL,
+    prompt: `فيديو من ${prompts.length} مشاهد وصفية — مقاطع ${clipSeconds} ثانية رأسي 9:16 بتحريك خفيف (توليد صور مجاني بلا مفتاح)`,
+    paramsJson: JSON.stringify({ prompts, clip_seconds: clipSeconds, wait_seconds: waitSecondsArg ?? 240 }),
+    provider: "merger",
+    status: "pending",
+  });
+
+  let jobId: string;
+  try {
+    const job = await createSlideshowFromPrompts(prompts, clipSeconds);
+    jobId = job.jobId;
+    await updateTask(taskId, { status: "processing", provider: "merger", providerTaskId: jobId, progress: 5 });
+  } catch (err) {
+    if (isServiceDeclaredError(err)) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await updateTask(taskId, { status: "failed", errorMessage: `فشل إنشاء مهمة العرض الصوري: ${msg.slice(0, 300)}` });
+    } else {
+      const current = await getTask(taskId);
+      if (current) {
+        await updateTask(taskId, {
+          errorMessage: "تعذر الوصول إلى خدمة الدمج مؤقتًا — ستُعاد المحاولة تلقائيًا.",
+          paramsJson: mergeParams(current, { _nextAttemptAt: new Date(Date.now() + RETRY_COOLDOWN_MS).toISOString() }),
+        });
+      }
+    }
+    return { task: (await getTask(taskId))! };
+  }
+
+  // فحص مسبق: أول مشهد يولَّد فورًا — إن ظل حد الخدمة المجانية مستنزفًا رغم الانتظار الداخلي
+  // نحاول مرة أخيرة بانتظار محدود ثم نفشل سريعًا برسالة البديل الواضحة (بدل انتظار طويل بلا جدوى)
+  notify?.(5, 100, "توليد صورة المشهد الأول (خدمة صور مجانية بلا مفتاح)…");
+  const preflightDeadline = Date.now() + 110_000;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    if (signal?.aborted) break;
+    const img = await generateSlideshowImage(jobId, 0);
+    if (img.state === "networkError") {
+      return { task: (await getTask(taskId))! }; // شبكتنا نحو خدمة الدمج — تُستأنف مع get_task
+    }
+    if (img.state === "mergerError") {
+      await updateTask(taskId, { status: "failed", errorMessage: `فشل العرض الصوري: ${img.message.slice(0, 300)}` });
+      return { task: (await getTask(taskId))! };
+    }
+    if (img.state === "ok") break;
+    if (img.state === "serviceDown") {
+      await updateTask(taskId, { status: "failed", errorMessage: freeImagegenFallbackMessage(img.message.slice(0, 200)) });
+      return { task: (await getTask(taskId))! };
+    }
+    // rateLimited: انتظار محدود ثم محاولة أخيرة
+    if (attempt < 2) {
+      const waitMs = Math.min(img.retryAfter * 1000 + 1_000, Math.max(0, preflightDeadline - Date.now()));
+      if (waitMs > 2_000) {
+        notify?.(5, 100, `حد الخدمة المجانية مستنزف — انتظار ~${Math.round(waitMs / 1000)} ثانية ثم إعادة المحاولة…`);
+        await sleep(waitMs);
+        continue;
+      }
+    }
+    await updateTask(taskId, {
+      status: "failed",
+      errorMessage: freeImagegenFallbackMessage("ظل حد الصورة كل ~45 ثانية لكل IP مستنزفًا رغم الانتظار (بذرة المشهد الأول محفوظة — الإعادة سريعة)"),
+    });
+    return { task: (await getTask(taskId))! };
+  }
+
+  const waitSeconds = Math.min(240, Math.max(0, waitSecondsArg ?? 240));
+  const task = await driveSlideshow(taskId, Date.now() + waitSeconds * 1000, notify, signal);
+  return { task };
+}
+
 /** تحديث مهمة عرض صوري جارية من الخدمة — يُستدعى من get_task ويعالج خطوة واحدة على الأقل */
 async function refreshSlideshowTask(task: TaskRow): Promise<TaskRow> {
   if (!task.providerTaskId) {
@@ -677,11 +823,13 @@ async function refreshSlideshowTask(task: TaskRow): Promise<TaskRow> {
     const params = internalParams(task);
     const nextAt = params._nextAttemptAt ? Date.parse(String(params._nextAttemptAt)) : 0;
     if (Date.now() < nextAt) return task;
+    const prompts = (params.prompts as string[] | undefined) ?? [];
     const images = (params.images as string[] | undefined) ?? [];
-    if (images.length < 4) return task;
     const clipSeconds = Number(params.clip_seconds) || 15;
+    const canRecreate = prompts.length >= 4 || images.length >= 4;
+    if (!canRecreate) return task;
     try {
-      const job = await createSlideshowJob(images, clipSeconds);
+      const job = prompts.length >= 4 ? await createSlideshowFromPrompts(prompts, clipSeconds) : await createSlideshowJob(images, clipSeconds);
       await updateTask(task.id, { status: "processing", provider: "merger", providerTaskId: job.jobId, progress: 5, errorMessage: null });
     } catch (err) {
       if (isServiceDeclaredError(err)) {

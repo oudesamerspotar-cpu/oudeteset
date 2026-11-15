@@ -1,11 +1,14 @@
 /**
  * اختبار e2e لأداة MCP الجديدة images_to_video عبر /mcp (ضد خادم التطوير على 3000):
- * 1) tools/list تتضمن images_to_video بمخططها الصحيح
- * 2) رحلة كاملة: 6 صور روابط محلية → اكتمال داخل نافذة الانتظار → رابط فيديو + رابط تنزيل
- * 3) get_task على المهمة → completed مع الروابط
- * 4) list_media?type=slideshow تعرضها
- * 5) رفض: 3 صور / 9 صور / روابط غير مباشرة — رسائل عربية
- * المتطلبات: node scripts/mock-libsql.js + خدمة الدمج على 4000 + next dev على 3000
+ * 1) tools/list تتضمن images_to_video بمخططها الصحيح (prompts + images + task_ids)
+ * 2) رحلة كاملة بالروابط: 6 صور روابط محلية → اكتمال → رابط فيديو + رابط تنزيل
+ * 3) رحلة prompts كاملة: 4 أوصاف مشاهد (خادم توليد وهمي على 4012) → فيديو 60 ثانية 720x1280
+ * 4) prompts مع حد مجاني يتعافى (limitedonce) → انتظار تلقائي ثم نجاح
+ * 5) prompts مع حد دائم (limitedforever) → فشل سريع برسالة البديل الواضحة (البديل مذكور)
+ * 6) رفض: prompts+images معًا / 3 مشاهد / 9 مشاهد
+ * 7) get_task + list_media(type=slideshow)
+ * المتطلبات: mock-libsql على 8087 + خدمة الدمج على 4000 (بمتغير IMAGEGEN_POLLINATIONS_BASE=http://127.0.0.1:4012/prompt)
+ *            + mock-imagegen على 4012 + next dev على 3000
  */
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -92,6 +95,7 @@ try {
   const schema = itv?.inputSchema ?? {};
   assert("minImages/maxImages = 4/8 في المخطط", schema.properties?.images?.minItems === 4 && schema.properties?.images?.maxItems === 8);
   assert("clip_seconds 5..20 في المخطط", schema.properties?.clip_seconds?.minimum === 5 && schema.properties?.clip_seconds?.maximum === 20);
+  assert("prompts في المخطط (4..8)", schema.properties?.prompts?.minItems === 4 && schema.properties?.prompts?.maxItems === 8);
 
   /* 2) رحلة كاملة بالروابط */
   console.log("  ⏳ تشغيل images_to_video على 6 صور (قد يستغرق ~30 ثانية)…");
@@ -137,16 +141,74 @@ try {
   const lmText = singleResult(lm.messages, lm.id) ?? "";
   assert("list_media(type=slideshow) تعرض المهمة", lmText.includes("عرض صوري") && lmText.includes("images-to-video"), lmText.slice(0, 200));
 
-  /* 5) الرفض */
+  /* 5) الرفض (روابط) */
   const few = await call("tools/call", { name: "images_to_video", arguments: { images: urls.slice(0, 3) } });
   const fewText = singleResult(few.messages, few.id) ?? "";
-  assert("رفض 3 صور برسالة عربية", fewText.includes("4 صور على الأقل"), fewText.slice(0, 150));
+  assert("رفض 3 صور برسالة عربية", fewText.includes("4 مشاهد/صور على الأقل"), fewText.slice(0, 150));
   const many = await call("tools/call", { name: "images_to_video", arguments: { images: Array.from({ length: 9 }, (_, i) => `https://x/${i}.jpg`) } });
   const manyText = singleResult(many.messages, many.id) ?? "";
   assert("رفض 9 صور برسالة عربية", manyText.includes("8"), manyText.slice(0, 150));
   const bad = await call("tools/call", { name: "images_to_video", arguments: { images: ["https://a/1.jpg", "https://a/2.jpg", "https://a/3.jpg", "notaurl"] } });
   const badText = singleResult(bad.messages, bad.id) ?? "";
   assert("رفض رابط غير مباشر برسالة عربية", badText.includes("روابط مباشرة"), badText.slice(0, 150));
+
+  /* 6) رحلة prompts كاملة (خادم التوليد الوهمي على 4012) */
+  console.log("  ⏳ تشغيل images_to_video بوضع prompts على 4 مشاهد…");
+  const t1 = Date.now();
+  const runP = await call("tools/call", {
+    name: "images_to_video",
+    arguments: {
+      prompts: ["مشهد غروب ذهبي", "شارع مدينة قديم", "مقهى هادئ", "بحر عند الفجر"],
+      wait_seconds: 200,
+    },
+  });
+  const runPText = singleResult(runP.messages, runP.id) ?? "";
+  console.log(`  ⏱ prompts اكتمل في ${((Date.now() - t1) / 1000).toFixed(1)}ث`);
+  assert("prompts: نجاح عربي", runPText.includes("✅"), runPText.slice(0, 250));
+  const pUrl = runPText.split("\n").find((l) => l.startsWith("الرابط المباشر:"))?.replace("الرابط المباشر:", "").trim();
+  assert("prompts: رابط فيديو مباشر", Boolean(pUrl && pUrl.startsWith("http")), pUrl);
+  if (pUrl) {
+    const buf = Buffer.from(await (await fetch(`${pUrl}?download=1`)).arrayBuffer());
+    fs.writeFileSync(path.join(TMP, "final-prompts.mp4"), buf);
+    const probe = JSON.parse(execFileSync("ffprobe", ["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path.join(TMP, "final-prompts.mp4")]).toString());
+    const v = probe.streams.find((s) => s.codec_type === "video");
+    assert("prompts: الناتج 720x1280", v?.width === 720 && v?.height === 1280, `${v?.width}x${v?.height}`);
+    assert("prompts: مدة 60 ثانية (4×15)", Math.abs(Number(probe.format?.duration) - 60) < 3, probe.format?.duration);
+  }
+
+  /* 7) prompts مع حد مجاني يتعافى (limitedonce — انتظار تلقائي ثم نجاح) */
+  console.log("  ⏳ prompts مع حد مؤقت يتعافى (retryAfter=2 ثانية في الوهمي)…");
+  const runR = await call("tools/call", {
+    name: "images_to_video",
+    arguments: {
+      prompts: ["مشهد limitedonce رقم واحد", "مشهد limitedonce رقم اثنين", "مشهد limitedonce رقم ثلاثة", "مشهد limitedonce رقم أربعة"],
+      wait_seconds: 200,
+    },
+  });
+  const runRText = singleResult(runR.messages, runR.id) ?? "";
+  assert("limitedonce: نجاح بعد انتظار تلقائي", runRText.includes("✅"), runRText.slice(0, 250));
+
+  /* 8) prompts مع حد دائم (limitedforever) → فشل سريع برسالة البديل */
+  const t2 = Date.now();
+  const runF = await call("tools/call", {
+    name: "images_to_video",
+    arguments: {
+      prompts: ["مشهد limitedforever أ", "مشهد limitedforever ب", "مشهد limitedforever ج", "مشهد limitedforever د"],
+      wait_seconds: 200,
+    },
+  });
+  const runFText = singleResult(runF.messages, runF.id) ?? "";
+  console.log(`  ⏱ limitedforever فشل سريعًا في ${((Date.now() - t2) / 1000).toFixed(1)}ث`);
+  assert("limitedforever: فشل صريح", runFText.includes("❌") && runFText.includes("Pollinations"), runFText.slice(0, 250));
+  assert("limitedforever: البديل مذكور (generate_image + task_ids/images + إعادة المحاولة)", runFText.includes("generate_image") && runFText.includes("أعد المحاولة"), runFText.slice(0, 400));
+
+  /* 9) رفض prompts + images معًا وعدد مشاهد خاطئ */
+  const both = await call("tools/call", { name: "images_to_video", arguments: { prompts: ["أ", "ب", "ج", "د"], images: urls.slice(0, 4) } });
+  const bothText = singleResult(both.messages, both.id) ?? "";
+  assert("رفض prompts مع images معًا", bothText.includes("ليس الاثنين"), bothText.slice(0, 150));
+  const fewP = await call("tools/call", { name: "images_to_video", arguments: { prompts: ["مشهد واحد فقط", "مشهد اثنان", "مشهد ثلاثة"] } });
+  const fewPText = singleResult(fewP.messages, fewP.id) ?? "";
+  assert("رفض 3 مشاهد برسالة عربية", fewPText.includes("4 مشاهد"), fewPText.slice(0, 150));
 } finally {
   staticServer.close();
 }

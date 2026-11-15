@@ -41,11 +41,16 @@ module.exports = async (req, res) => {
   const source = job.sources.find((s) => s.seq === seq);
   if (!source) return sendError(res, 404, `لا توجد صورة بالرقم seq=${seq} في هذه المهمة (المدى 0..${n - 1})`);
 
-  // الصورة يجب أن تكون مرفوعة بالكامل إن كانت ملفًا
+  // الصورة يجب أن تكون جاهزة: مرفوعة بالكامل (file) أو مولّدة مسبقًا (prompt)
   if (source.kind === "file") {
     const { bytes } = await store.sourceChunkCount(job.id, seq);
     if (bytes !== source.size) {
       return sendError(res, 400, `الصورة "${source.name}" لم تُرفع بالكامل (${bytes} من ${source.size} بايت)`);
+    }
+  } else if (source.kind === "prompt") {
+    const { bytes } = await store.sourceChunkCount(job.id, seq);
+    if (bytes <= 0) {
+      return sendError(res, 400, `صورة المشهد ${seq + 1} غير مولّدة بعد — استدعِ POST /api/slideshow/${jobId}/image?seq=${seq} أولًا`);
     }
   }
 
@@ -54,13 +59,17 @@ module.exports = async (req, res) => {
 
   try {
     const result = await withTmpDir(`${job.id}-${seq}`, async (dir) => {
-      // 1) تهيئة الصورة محليًا (تنزيل رابط أو تجميع ملف مرفوع)
+      // 1) تهيئة الصورة محليًا (تنزيل رابط، أو تجميع ملف مرفوع/صورة مولّدة من prompts)
       const imgPath = path.join(dir, `img-${seq}`);
       if (source.kind === "url") {
         await downloadUrl(source.url, imgPath, LIMITS.SLIDESHOW_IMAGE_MAX_MB * 1024 * 1024);
       } else {
-        const assembled = await store.assembleSource(job.id, seq, source.size, imgPath);
-        if (!assembled) throw new Error(`الصورة "${source.name}" غير مكتملة في التخزين — أعد رفعها`);
+        // file: الحجم المعلن عند الرفع — prompt: نمرر 0 لنبني من كل الصفوف المخزنة
+        const expected = source.kind === "file" ? source.size : 0;
+        const assembled = await store.assembleSource(job.id, seq, expected, imgPath);
+        if (!assembled) {
+          throw new Error(source.kind === "prompt" ? "صورة المشهد غير موجودة في التخزين — أعد خطوة /image" : `الصورة "${source.name}" غير مكتملة في التخزين — أعد رفعها`);
+        }
       }
 
       // 2) فحص البايتات: يجب أن تكون صورة مدعومة (JPG/PNG/WEBP/GIF/BMP)

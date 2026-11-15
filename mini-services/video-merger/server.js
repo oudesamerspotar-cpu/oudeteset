@@ -22,6 +22,7 @@ const cronHandler = require("./api/cron");
 const slideshowHandler = require("./api/slideshow");
 const slideshowIdHandler = require("./api/slideshow/[id]");
 const slideshowClipHandler = require("./api/slideshow/[id]/clip");
+const slideshowImageHandler = require("./api/slideshow/[id]/image");
 const slideshowMergeHandler = require("./api/slideshow/[id]/merge");
 
 const PORT = Number(process.env.PORT || 4000);
@@ -56,8 +57,13 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/cron") return await cronHandler(req, res);
     if (p === "/api/slideshow") return await slideshowHandler(req, res);
 
-    // /api/slideshow/<id>/clip و /merge
+    // /api/slideshow/<id>/image و /clip و /merge
     let m2;
+    m2 = /^\/api\/slideshow\/([^/]+)\/image$/.exec(p);
+    if (m2) {
+      req.query.id = decodeURIComponent(m2[1]);
+      return await slideshowImageHandler(req, res);
+    }
     m2 = /^\/api\/slideshow\/([^/]+)\/clip$/.exec(p);
     if (m2) {
       req.query.id = decodeURIComponent(m2[1]);

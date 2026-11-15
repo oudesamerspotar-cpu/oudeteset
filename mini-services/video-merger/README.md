@@ -52,29 +52,31 @@
 | `GET` | `/api/config` | الحدود العامة + version (فحص الجهوزية) |
 | `GET` | `/api/cron` | حذف المهام المنتهية (Cron يومي في `vercel.json`) |
 
-### العرض الصوري — صور ← فيديو رأسي 9:16 بتحريك خفيف (بلا أي API مدفوع)
+### العرض الصوري — مشاهد نصية/صور ← فيديو رأسي 9:16 بتحريك خفيف (بلا أي API مدفوع)
 
 | Method | Endpoint | الوظيفة |
 |---|---|---|
-| `POST` | `/api/slideshow` | إنشاء مهمة عرض صوري: `{"images":["url",...]}` روابط مباشرة أو `{"sources":[{"kind":"file","name","size","mime"},...]}` لرفع ملفات. اختياري: `"clip_seconds": 5..20` (افتراضي 15). القيود: 4–8 صور، ≤ SLIDESHOW_IMAGE_MAX_MB لكل صورة |
-| `POST` | `/api/slideshow/<id>/clip?seq=<k>` | معالجة الصورة رقم k: مقطع 15 ثانية رأسي 720×1280 @ 24fps بتقريب/تحريك خفيف (Ken Burns) + وهج دخول/خروج — يخزَّن في Turso |
+| `POST` | `/api/slideshow` | إنشاء مهمة عرض صوري بأحد الأوضاع: `{"prompts":["وصف مشهد 1",...]}` أوصاف نصية (كل وصف تولَّد صورته من خدمة مجانية بلا مفتاح — Pollinations)، أو `{"images":["url",...]}` روابط مباشرة، أو `{"sources":[{"kind":"file","name","size","mime"},...]}` لرفع ملفات. اختياري: `"clip_seconds": 5..20` (افتراضي 15). القيود: 4–8 مشاهد/صور، وصف 3–600 حرف، ≤ SLIDESHOW_IMAGE_MAX_MB لكل صورة |
+| `POST` | `/api/slideshow/<id>/image?seq=<k>` | **لمشاهد prompts فقط**: توليد صورة المشهد من وصفه عبر Pollinations وتخزينها في Turso. إعادة الاستدعاء idempotent (نفس البذرة → نفس الصورة من الذاكرة المؤقتة). عند استنزاف الحد المجاني (~صورة كل 45 ثانية لكل IP): ينتظر داخليًا مرة واحدة ثم يرد `429 {"error","retryAfter","retryable":true}` — المهمة تبقى processing وليست فاشلة. خدمة غير متاحة → `503 {"retryable":true}` |
+| `POST` | `/api/slideshow/<id>/clip?seq=<k>` | معالجة المشهد رقم k: مقطع 15 ثانية رأسي 720×1280 @ 24fps بتقريب/تحريك خفيف (Ken Burns) + وهج دخول/خروج — يخزَّن في Turso. لمشاهد prompts تشترط خطوة /image أولًا؛ لمصادر file/url يجهّز الصورة بنفسه |
 | `POST` | `/api/slideshow/<id>/merge` | دمج المقاطع في فيديو MP4 واحد عبر محوّل concat مع `-c copy` (بلا إعادة ترميز — ثوانٍ معدودة) |
-| `GET` | `/api/slideshow/<id>` | حالة تفصيلية: الصور الجاهزة/المتبقية + روابط الخطوات + الناتج عند الاكتمال |
+| `GET` | `/api/slideshow/<id>` | حالة تفصيلية: لكل مشهد `kind` و`imageReady` و`ready` + روابط الخطوات + الناتج عند الاكتمال |
 | `DELETE` | `/api/slideshow/<id>` | حذف شامل (نفس حذف مهام الدمج) |
 
 الناتج النهائي يُبَث ويُنزَّل من نفس نقاط الدمج: `GET /api/jobs/<id>/video` و`?download=1`.
-التقدم الكلي: رفع 0–39٪ → مقاطع 40–90٪ → دمج 90–100٪. تنفيذ كل صورة في استدعاء مستقل يُبقي كل نداء داخل مهلة دالة Vercel (60 ثانية على الخطة المجانية — الدقة 720×1280 مضبوطة لهذا السبب، ويمكن رفعها بمتغيرات `SLIDESHOW_WIDTH`/`SLIDESHOW_HEIGHT`).
+التقدم الكلي: رفع 0–39٪ → مقاطع 40–90٪ → دمج 90–100٪. تنفيذ كل مشهد في استدعاءات مستقلة (توليد ثم ترميز) يُبقي كل نداء داخل مهلة دالة Vercel (60 ثانية على الخطة المجانية — الدقة 720×1280 مضبوطة لهذا السبب، ويمكن رفعها بمتغيرات `SLIDESHOW_WIDTH`/`SLIDESHOW_HEIGHT`).
+**حد الخدمة المجانية لتوليد الصور**: Pollinations تسمح ~صورة واحدة كل 45 ثانية لكل IP — الروابط حتمية البذرة (seed مشتق من المهمة وترتيب المشهد) فإعادة المحاولة تعيد نفس الصورة سريعًا من ذاكرتهم المؤقتة. لا يعتمد المشروع أي مفتاح مدفوع في هذا المسار.
 
 ```bash
-# 1) إنشاء مهمة عرض صوري من روابط
+# 1) إنشاء مهمة من أوصاف مشاهد نصية (توليد مجاني بلا مفتاح)
 curl -X POST https://<دومينك>/api/slideshow \
   -H "Content-Type: application/json" \
-  -d '{"images":["https://example.com/1.jpg","https://example.com/2.jpg","https://example.com/3.jpg","https://example.com/4.jpg"]}'
-# → 201 {"jobId":"...","imageCount":4,"clipSeconds":15,"clipUrl":".../clip?seq=<k>","mergeUrl":".../merge",...}
+  -d '{"prompts":["غروب شمس ذهبي على كثبان الصحراء","شارع مدينة قديمة بأضواء دافئة","مقهى هادئ مع بخار قهوة","بحر هادئ عند الفجر"]}'
+# → 201 {"jobId":"...","mode":"prompts","imageCount":4,"imageUrl":".../image?seq=<k>","clipUrl":".../clip?seq=<k>","mergeUrl":".../merge",...}
 
-# 2) معالجة كل صورة بالترتيب (كل استدعاء ~3–40 ثانية حسب قدرة المعالج)
-curl -X POST "https://<دومينك>/api/slideshow/<id>/clip?seq=0"
-# → {"ok":true,"seq":0,"clipsReady":1,"totalImages":4,"progress":52,"remaining":[1,2,3],...}
+# 2) لكل مشهد: توليد الصورة ثم ترميز المقطع (بالترتيب)
+curl -X POST "https://<دومينك>/api/slideshow/<id>/image?seq=0"   # → {"ok":true,"seq":0,"cached":false,"size":...} أو 429 مع retryAfter
+curl -X POST "https://<دومينك>/api/slideshow/<id>/clip?seq=0"    # → {"ok":true,"clipsReady":1,"totalImages":4,"progress":52,...}
 
 # 3) بعد اكتمال كل المقاطع: الدمج النهائي
 curl -X POST "https://<دومينك>/api/slideshow/<id>/merge"
@@ -84,12 +86,15 @@ curl -X POST "https://<دومينك>/api/slideshow/<id>/merge"
 
 | متغير البيئة (اختياري) | الافتراضي | الوظيفة |
 |---|---|---|
-| `SLIDESHOW_MIN_IMAGES` / `SLIDESHOW_MAX_IMAGES` | 4 / 8 | حدود عدد الصور |
+| `SLIDESHOW_MIN_IMAGES` / `SLIDESHOW_MAX_IMAGES` | 4 / 8 | حدود عدد المشاهد/الصور |
 | `SLIDESHOW_IMAGE_MAX_MB` | 15 | حد حجم الصورة الواحدة |
-| `SLIDESHOW_CLIP_SEC` | 15 | مدة مقطع كل صورة (قابلة للتجاوز لكل مهمة بـ `clip_seconds` 5–20) |
+| `SLIDESHOW_CLIP_SEC` | 15 | مدة مقطع كل مشهد (قابلة للتجاوز لكل مهمة بـ `clip_seconds` 5–20) |
 | `SLIDESHOW_WIDTH` / `SLIDESHOW_HEIGHT` | 720 / 1280 | مقاس الناتج (رأسي 9:16) |
 | `SLIDESHOW_FPS` | 24 | معدل الإطارات |
 | `SLIDESHOW_PRESET` / `SLIDESHOW_CRF` | veryfast / 20 | سرعة/جودة ترميز libx264 |
+| `SLIDESHOW_IMAGE_MODEL` | (افتراضي الخدمة) | موديل Pollinations لوضع prompts (مثل flux) |
+| `IMAGEGEN_POLLINATIONS_BASE` | https://image.pollinations.ai/prompt | قاعدة خدمة توليد الصور المجانية |
+| `IMAGEGEN_ATTEMPT_TIMEOUT_MS` / `IMAGEGEN_MAX_WAIT_MS` | 75000 / 45000 | مهلة محاولة التوليد وميزانية الانتظار الداخلي عند حد 402 |
 
 ### أمثلة curl (الدمج العادي)
 
